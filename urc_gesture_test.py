@@ -12,6 +12,10 @@ python urc_gesture_test.py --self-test
 FOLLOW: one arm raised, opposite arm resting down. STOP/STAY: both arms raised.
 Raised arms may angle outward and bend slightly; exact vertical alignment is unnecessary.
 COME: both straight outward. Start/rearm with both arms down for 0.4 s.
+FETCH (long range): one arm straight sideways, either side, opposite arm down.
+FETCH emits range_mode="long"; the rover controller owns the travel behavior.
+Long-range vision defaults to 960px tracking plus a closer pose pass on the target.
+Use --no-long-range for the lighter 640px single-pass mode.
 Only shoulders, elbows and wrists are required; hips/legs can be out of frame.
 The camera is assumed upright. Use --shoulder-frame for a tilted camera.
 Use --require-hips for the stricter full-torso reference frame.
@@ -38,7 +42,7 @@ REQUIRED = [L_SH, R_SH, L_EL, R_EL, L_WR, R_WR]
 JOINT_NAMES = {L_SH: "L shoulder", R_SH: "R shoulder", L_EL: "L elbow",
                R_EL: "R elbow", L_WR: "L wrist", R_WR: "R wrist",
                L_HIP: "L hip", R_HIP: "R hip"}
-COMMANDS = {"FOLLOW": "FOLLOW", "STOP": "STAY", "COME": "COME"}
+COMMANDS = {"FOLLOW": "FOLLOW", "STOP": "STAY", "COME": "COME", "FETCH": "FETCH"}
 
 
 @dataclass
@@ -64,7 +68,7 @@ def angle_deg(a, b, c):
 
 
 def classify(kp, cf, config=None, relaxed=False):
-    """Return FOLLOW/STOP/COME/NEUTRAL/NONE/UNKNOWN and diagnostic geometry.
+    """Return FOLLOW/STOP/COME/FETCH/NEUTRAL/NONE/UNKNOWN and diagnostic geometry.
 
     UNKNOWN means untrusted geometry; NONE means visible but not a command.
     Neither is evidence of arms-down release. Default directions use the upright
@@ -180,6 +184,8 @@ def classify(kp, cf, config=None, relaxed=False):
         label = "FOLLOW"
     elif left["out"] and right["out"]:
         label = "COME"
+    elif (left["out"] and right["down"]) or (right["out"] and left["down"]):
+        label = "FETCH"
     elif left["down"] and right["down"]:
         label = "NEUTRAL"
     else:
@@ -193,12 +199,17 @@ def classify(kp, cf, config=None, relaxed=False):
             detail["reason"] = f"FOLLOW blocked: {other} arm not down"
             detail["hint"] = f"{other} arm: " + "; ".join(arms[other]["down_rejected"])
         else:
+            sideways = [side for side in arms if arms[side]["out"]]
             near_up = [side for side, arm in arms.items() if arm["up_tilt_deg"] < 75]
-            if near_up:
+            if len(sideways) == 1:
+                other = "R" if sideways[0] == "L" else "L"
+                detail["reason"] = f"FETCH blocked: {other} arm not down"
+                detail["hint"] = f"{other} arm: " + "; ".join(arms[other]["down_rejected"])
+            elif near_up:
                 detail["hint"] = " | ".join(
                     f"{side}: " + "; ".join(arms[side]["up_rejected"]) for side in near_up)
             else:
-                detail["hint"] = "Raise one or both arms; or extend both arms sideways for COME."
+                detail["hint"] = "FETCH: one arm sideways, other down | COME: both sideways."
     return label, detail
 
 
@@ -359,16 +370,26 @@ def pose_arrays(result):
     return result.keypoints.xy.cpu().numpy(), result.keypoints.conf.cpu().numpy()
 
 
+def pose_quality(kp, cf, required):
+    """Prefer refinement only when it improves confidence in required joints."""
+    scores = np.asarray(cf[required], dtype=float).copy()
+    valid = (np.isfinite(kp[required]).all(axis=1) & np.isfinite(scores) &
+             ~np.all(kp[required] == 0, axis=1))
+    scores[~valid] = 0
+    return float(scores.min()), float(scores.mean())
+
+
 def status_rows(raw, confirmed, progress, mode, target_id, fps, armed, detail, target_status):
     arms = detail.get("arms", {})
     arm_text = " | ".join(
         f"{side} arm: {arm['state']} (elbow {arm['elbow_deg']:.0f} deg"
         + (f", down tilt {arm['down_tilt_deg']:.0f} deg" if arm['state'] == "OTHER" else "") + ")"
         for side, arm in arms.items())
-    hint = detail.get("hint", "FOLLOW: one arm up, other down | STOP: both up | COME: both out")
-    if mode == "GESTURE" and raw in ("FOLLOW", "COME") and not armed:
+    hint = detail.get("hint", "FOLLOW: one up | STAY: both up | FETCH: one sideways | COME: both sideways")
+    if mode == "GESTURE" and raw in COMMANDS and raw != "STOP" and not armed:
         hint = "Gesture recognized. Lower both arms briefly to rearm, then repeat it."
-    return [f"GESTURE NOW: {raw} | last command: {confirmed} | hold {progress:.0%}",
+    current = "FETCH (LONG RANGE)" if raw == "FETCH" else raw
+    return [f"GESTURE NOW: {current} | last command: {confirmed} | hold {progress:.0%}",
             f"MODE {mode} | target {target_id} | {fps:.1f} FPS | {target_status}",
             f"{'ARMED' if armed else 'NEED ARMS DOWN'} | {detail['reason']}",
             f"{detail.get('body_frame', 'Arms')}: " + (arm_text or
@@ -397,6 +418,8 @@ def send_command(label, event=None, publisher=None):
     payload = dict(event or {})
     payload.update(command=COMMANDS[label], label=label, source="gesture",
                    emitted_unix=time.time())
+    if label == "FETCH":
+        payload["range_mode"] = "long"
     message = json.dumps(payload, separators=(",", ":"), allow_nan=False)
     print(message, flush=True)
     if publisher is not None:
@@ -431,6 +454,7 @@ def self_test():
 
     for left, right, expected in [("up", "down", "FOLLOW"), ("down", "up", "FOLLOW"),
                                    ("up", "up", "STOP"), ("out", "out", "COME"),
+                                   ("out", "down", "FETCH"), ("down", "out", "FETCH"),
                                    ("down", "down", "NEUTRAL"), ("up", "out", "NONE")]:
         p = pose(left, right)
         for scale in [0.15, 1.0, 3.0]:
@@ -545,6 +569,7 @@ def self_test():
     arms_conf[REQUIRED] = 1
     for left, right, expected in [("up", "down", "FOLLOW"), ("down", "up", "FOLLOW"),
                                    ("up", "up", "STOP"), ("out", "out", "COME"),
+                                   ("out", "down", "FETCH"), ("down", "out", "FETCH"),
                                    ("down", "down", "NEUTRAL")]:
         for arm_scale in [0.6, 1.0, 1.5]:
             upper_body = pose(left, right)
@@ -692,6 +717,57 @@ def self_test():
     sparse.update("STOP", 0)
     check(not sparse.update("STOP", 0.2)[2], "two sparse samples cannot confirm")
 
+    for side in ["L", "R"]:
+        fetch_pose = pose("out", "down") if side == "L" else pose("down", "out")
+        replay, events = GestureDebouncer(), []
+        for frame_no, sample in enumerate([pose("down", "down")] * 12 + [fetch_pose] * 45):
+            observed, _ = classify(sample, arms_conf)
+            accepted, _, fired = replay.update(observed, (frame_no + 1) * 0.05)
+            if fired:
+                events.append(accepted)
+        check(events == ["FETCH"], f"held {side}-arm FETCH emits once after neutral")
+    deb, tick = GestureDebouncer(), 0.0
+    check(not feed("FETCH", 1), "FETCH needs neutral at startup")
+    feed("NEUTRAL", 0.5)
+    check(feed("FETCH", 0.85) == ["FETCH"], "held FETCH")
+    check(not feed("FETCH", 1), "FETCH does not repeat")
+    check(feed("STOP", 0.5) == ["STOP"], "STOP interrupts FETCH")
+    check(not feed("FETCH", 1), "FETCH after STOP needs neutral")
+    feed("NEUTRAL", 0.5)
+    check(feed("FETCH", 0.85) == ["FETCH"], "FETCH rearmed after STOP")
+    feed("UNKNOWN", 0.6)
+    check(not feed("FETCH", 1), "missing pose does not rearm FETCH")
+    inward = pose("out", "down")
+    inward[L_EL], inward[L_WR] = inward[L_SH] + [60, 0], inward[L_SH] + [120, 0]
+    check(classify(inward, cf)[0] == "NONE", "cross-body arm does not trigger FETCH")
+    bent_fetch = raised_arm(pose("down", "down"), "L", 90, 60)
+    check(classify(bent_fetch, cf)[0] == "NONE", "folded sideways arm does not trigger FETCH")
+    fetch_boundary = raised_arm(pose("down", "down"), "L", 68, 0)
+    check(classify(fetch_boundary, cf)[0] == "NONE" and
+          classify(fetch_boundary, cf, relaxed=True)[0] == "FETCH", "FETCH angular hysteresis")
+    weak_fetch = cf.copy()
+    weak_fetch[L_WR] = 0
+    check(classify(pose("out", "down"), weak_fetch)[0] == "UNKNOWN", "FETCH still requires its wrist")
+    fetch_rows = status_rows("FETCH", "NONE", 0.5, "GESTURE", 1, 30, False,
+                             {"reason": "ok"}, "locked")
+    check("LONG RANGE" in fetch_rows[0] and "rearm" in fetch_rows[-1], "FETCH range and release in UI")
+    import io
+    from contextlib import redirect_stdout
+    output = io.StringIO()
+    with redirect_stdout(output):
+        payload = send_command("FETCH", {"track_id": 5, "sequence": 1})
+    check(json.loads(output.getvalue()) == payload and payload["command"] == "FETCH" and
+          payload["range_mode"] == "long" and payload["track_id"] == 5,
+          "FETCH JSON intent declares long-range rover behavior")
+    weak_pose = cf.copy()
+    weak_pose[R_WR] = 0.2
+    check(pose_quality(p, cf, REQUIRED) > pose_quality(p, weak_pose, REQUIRED),
+          "refinement must improve weakest required joint")
+    invalid_pose = p.copy()
+    invalid_pose[R_WR] = np.nan
+    check(pose_quality(p, weak_pose, REQUIRED) > pose_quality(invalid_pose, cf, REQUIRED),
+          "a missing refined wrist cannot displace a visible wrist")
+
     clock = MediaClock(30)
     check(np.allclose([clock.update(x) for x in [0, 0, 0]], [0, 1/30, 2/30]),
           "video timestamp fallback")
@@ -729,7 +805,10 @@ def main():
     ap.add_argument("--cam", type=int, default=0)
     ap.add_argument("--video")
     ap.add_argument("--video-fps", type=float, help="fallback FPS if video metadata is absent")
-    ap.add_argument("--imgsz", type=int, default=640)
+    ap.add_argument("--imgsz", type=int,
+                    help="tracking input size (default: 960 long-range; 640 with --no-long-range)")
+    ap.add_argument("--long-range", action=argparse.BooleanOptionalAction, default=True,
+                    help="use higher-resolution tracking and target-crop pose refinement (default: enabled)")
     ap.add_argument("--conf", type=float, default=0.3)
     ap.add_argument("--kp-conf", type=float, default=0.5)
     ap.add_argument("--up-angle", type=float, default=GeometryConfig.up_deg,
@@ -767,6 +846,8 @@ def main():
     if args.self_test:
         self_test()
         return
+    if args.imgsz is None:
+        args.imgsz = 960 if args.long_range else 640
     if (not 0 < args.kp_conf <= 1 or not 0 < args.conf <= 1 or
             not all(math.isfinite(v) and v > 0 for v in
                     [args.hold, args.release, args.cooldown, args.stop_hold, args.max_gap,
@@ -779,7 +860,11 @@ def main():
     from ultralytics import YOLO
 
     pose_model = YOLO(args.model, task="pose")
-    detector = YOLO(args.detector) if args.crop_pose else pose_model
+    refine_pose = args.crop_pose or args.long_range
+    # Keep crop prediction separate from tracking: the tracker's callbacks/state
+    # must not be advanced a second time for the same source frame.
+    detector = (YOLO(args.detector) if args.crop_pose else
+                YOLO(args.model, task="pose") if args.long_range else pose_model)
     cap = cv2.VideoCapture(args.video if args.video else args.cam)
     if not cap.isOpened():
         raise SystemExit("Could not open video source")
@@ -853,8 +938,13 @@ def main():
                 deb.reset()
             raw, detail = "UNKNOWN", {"reason": target_status}
             selected_kp, selected_cf = None, None
+            pose_source = "none"
             if idx is not None:
-                if args.crop_pose:
+                kps, confs = pose_arrays(result)
+                if kps is not None:
+                    selected_kp, selected_cf = kps[idx], confs[idx]
+                    pose_source = "full frame"
+                if refine_pose:
                     x1, y1, x2, y2 = crop_bounds(boxes[idx], frame.shape)
                     crop_result = pose_model.predict(frame[y1:y2, x1:x2], imgsz=args.pose_imgsz,
                                                      classes=[0], **options)[0]
@@ -863,11 +953,12 @@ def main():
                         mapped_boxes = crop_result.boxes.xyxy.cpu().numpy() + [x1, y1, x1, y1]
                         matched = match_crop_pose(mapped_boxes, boxes[idx])
                         if matched is not None:
-                            selected_kp, selected_cf = kps[matched] + [x1, y1], confs[matched]
-                else:
-                    kps, confs = pose_arrays(result)
-                    if kps is not None:
-                        selected_kp, selected_cf = kps[idx], confs[idx]
+                            crop_kp, crop_cf = kps[matched] + [x1, y1], confs[matched]
+                            if (selected_kp is None or
+                                    pose_quality(crop_kp, crop_cf, required_joints) >
+                                    pose_quality(selected_kp, selected_cf, required_joints)):
+                                selected_kp, selected_cf = crop_kp, crop_cf
+                                pose_source = "target crop"
                 if selected_kp is not None:
                     raw, detail = classify(selected_kp, selected_cf, geometry)
                     if raw == "NONE" and deb.candidate in COMMANDS:
@@ -885,6 +976,7 @@ def main():
                     detail = {"reason": "missing/ambiguous pose or confidence"}
             detail.setdefault("body_frame", "shoulders + hips" if args.require_hips else
                               "shoulders (arms only)" if args.shoulder_frame else "upright camera (arms only)")
+            detail["pose_source"] = pose_source
             confirmed, progress, fired = deb.update(raw if mode == "GESTURE" else "UNKNOWN", timestamp)
             event = None
             if fired:
